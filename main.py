@@ -1,9 +1,11 @@
 import os
 import io
 import re
-import sqlite3
 import datetime
 import hashlib
+import decimal
+import mysql.connector
+from mysql.connector import Error, pooling
 from contextlib import contextmanager
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, status, Depends, UploadFile, File
@@ -12,220 +14,92 @@ from pydantic import BaseModel, Field
 import pypdf
 
 # -----------------------------------------------------------------------------
-# CONFIGURAÇÕES DE AMBIENTE
+# AUXILIARES DE SERIALIZAÇÃO MYSQL
 # -----------------------------------------------------------------------------
-DB_PATH = "ecoconta.db"
-SCHEMA_PATH = "ecoconta_schema.sql"
-
-# -----------------------------------------------------------------------------
-# INICIALIZAÇÃO AUTOMÁTICA DO BANCO DE DADOS (ENGINEERING BEST PRACTICE)
-# -----------------------------------------------------------------------------
-def init_db():
+def dict_mysql(row):
     """
-    Verifica se a estrutura do banco de dados já existe.
-    Caso contrário, executa de forma idempotente o script SQL de modelagem analítica.
+    Converte um dicionário de resultado MySQL convertendo objetos do tipo Decimal em float
+    e objetos datetime/date em strings ISO, para garantir serialização JSON nativa rápida.
     """
-    schema_exists = False
-    if os.path.exists(DB_PATH):
-        try:
-            with sqlite3.connect(DB_PATH) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='residencias';")
-                if cursor.fetchone():
-                    schema_exists = True
-        except sqlite3.Error:
-            pass
-
-    if not schema_exists:
-        print("🛠️ Inicializando o banco de dados a partir do ecoconta_schema.sql...")
-        if os.path.exists(SCHEMA_PATH):
-            try:
-                with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-                    schema_sql = f.read()
-                with sqlite3.connect(DB_PATH) as conn:
-                    # Executa todo o script de modelagem, views e data seeding
-                    conn.executescript(schema_sql)
-                print("✅ Banco de dados inicializado com sucesso com presets e testes!")
-            except Exception as e:
-                print(f"❌ Erro ao ler ou executar o schema SQL: {e}")
-        else:
-            print(f"⚠️ Alerta: Arquivo '{SCHEMA_PATH}' não encontrado no diretório atual.")
-    else:
-        print("⚡ Banco de dados já estruturado e pronto para operação.")
-
-def migrate_db():
-    """
-    Executa migrações incrementais no banco SQLite de forma segura.
-    Garante que colunas extras sejam criadas e as views analíticas sejam atualizadas com as novas regras de negócio.
-    """
-    try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            
-            # Verificar se a tabela usuarios existe, senão cria
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='usuarios';")
-            if not cursor.fetchone():
-                print("🛠️ Aplicando migração: Criando tabela 'usuarios'...")
-                cursor.execute("""
-                CREATE TABLE usuarios (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    nome TEXT NOT NULL CHECK(length(trim(nome)) > 0),
-                    email TEXT NOT NULL UNIQUE CHECK(email LIKE '%_@__%.__%'),
-                    senha_hash TEXT NOT NULL CHECK(length(senha_hash) > 0),
-                    criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-                """)
-                conn.commit()
-                print("✅ Tabela 'usuarios' criada com sucesso.")
-
-            # Verificar se a coluna usuario_id existe em residencias
-            cursor.execute("PRAGMA table_info(residencias);")
-            res_cols = [row[1] for row in cursor.fetchall()]
-            if "usuario_id" not in res_cols:
-                print("🛠️ Aplicando migração: Adicionando coluna 'usuario_id' em 'residencias'...")
-                cursor.execute("ALTER TABLE residencias ADD COLUMN usuario_id INTEGER REFERENCES usuarios(id) ON DELETE CASCADE;")
-                conn.commit()
-                print("✅ Coluna 'usuario_id' adicionada com sucesso em 'residencias'.")
-            
-            # Verificar se a coluna dias_faturamento existe na tabela contas_energia
-            cursor.execute("PRAGMA table_info(contas_energia);")
-            columns = [row[1] for row in cursor.fetchall()]
-            
-            if "dias_faturamento" not in columns:
-                print("🛠️ Aplicando migração: Adicionando 'dias_faturamento' em 'contas_energia'...")
-                cursor.execute("ALTER TABLE contas_energia ADD COLUMN dias_faturamento INTEGER DEFAULT 30 CHECK(dias_faturamento >= 1 AND dias_faturamento <= 100);")
-                conn.commit()
-                print("✅ Coluna 'dias_faturamento' adicionada com sucesso.")
-            
-            # Recriar as views analíticas para refletir a calibragem dinâmica de dias faturados
-            print("🔄 Atualizando Views analíticas para suporte a dias de faturamento dinâmicos...")
-            cursor.execute("DROP VIEW IF EXISTS v_simulador_modo_e_se;")
-            cursor.execute("DROP VIEW IF EXISTS v_diagnostico_faturamento;")
-            cursor.execute("DROP VIEW IF EXISTS v_consumo_projetado_aparelhos;")
-            
-            # 1. v_consumo_projetado_aparelhos (Tarifa mais recente da distribuidora)
-            cursor.execute("""
-            CREATE VIEW v_consumo_projetado_aparelhos AS
-            WITH tarifa_atual AS (
-                SELECT 
-                    residencia_id,
-                    tarifa_calculada,
-                    dias_faturamento,
-                    mes_referencia
-                FROM contas_energia
-                WHERE (residencia_id, mes_referencia) IN (
-                    SELECT residencia_id, MAX(mes_referencia)
-                    FROM contas_energia
-                    GROUP BY residencia_id
-                )
-            )
-            SELECT 
-                inv.id AS inventario_id,
-                inv.residencia_id,
-                r.nome AS residencia_nome,
-                inv.nome_personalizado,
-                inv.potencia_utilizada,
-                inv.horas_dia,
-                COALESCE(ta.dias_faturamento, inv.dias_mes) AS dias_mes,
-                ROUND(((inv.potencia_utilizada * inv.horas_dia * COALESCE(ta.dias_faturamento, inv.dias_mes)) / 1000.0), 2) AS consumo_projetado_kwh,
-                ROUND(((inv.potencia_utilizada * inv.horas_dia * COALESCE(ta.dias_faturamento, inv.dias_mes)) / 1000.0) * COALESCE(ta.tarifa_calculada, 0.85), 2) AS custo_projetado_reais,
-                ROUND(((inv.potencia_utilizada * inv.horas_dia * COALESCE(ta.dias_faturamento, inv.dias_mes)) / 1000.0) * 0.09, 3) AS pegada_carbono_kg_co2
-            FROM inventario_usuario inv
-            JOIN residencias r ON inv.residencia_id = r.id
-            LEFT JOIN tarifa_atual ta ON inv.residencia_id = ta.residencia_id;
-            """)
-            
-            # 2. v_diagnostico_faturamento (Auditoria Cruzada Mapeada com Dias da Fatura Real)
-            cursor.execute("""
-            CREATE VIEW v_diagnostico_faturamento AS
-            WITH consumo_inventario_por_mes AS (
-                SELECT 
-                    inv.residencia_id,
-                    c.mes_referencia,
-                    SUM(ROUND(((inv.potencia_utilizada * inv.horas_dia * COALESCE(c.dias_faturamento, 30)) / 1000.0), 2)) AS total_kwh_projetado,
-                    SUM(ROUND(((inv.potencia_utilizada * inv.horas_dia * COALESCE(c.dias_faturamento, 30)) / 1000.0) * c.tarifa_calculada, 2)) AS total_reais_projetado
-                FROM inventario_usuario inv
-                JOIN contas_energia c ON inv.residencia_id = c.residencia_id
-                GROUP BY inv.residencia_id, c.mes_referencia
-            )
-            SELECT 
-                c.residencia_id,
-                r.nome AS residencia_nome,
-                c.mes_referencia,
-                c.consumo_kwh AS consumo_real_kwh,
-                c.valor_reais AS valor_real_reais,
-                COALESCE(i.total_kwh_projetado, 0.0) AS consumo_inventariado_kwh,
-                COALESCE(i.total_reais_projetado, 0.0) AS valor_inventariado_reais,
-                ROUND(c.consumo_kwh - COALESCE(i.total_kwh_projetado, 0.0), 2) AS desvio_kwh,
-                ROUND((COALESCE(i.total_kwh_projetado, 0.0) / c.consumo_kwh) * 100, 1) AS percentual_mapeado
-            FROM contas_energia c
-            JOIN residencias r ON c.residencia_id = r.id
-            LEFT JOIN consumo_inventario_por_mes i ON c.residencia_id = i.residencia_id AND c.mes_referencia = i.mes_referencia;
-            """)
-            
-            # 3. v_simulador_modo_e_se (Baseado na View A)
-            cursor.execute("""
-            CREATE VIEW v_simulador_modo_e_se AS
-            SELECT 
-                inventario_id,
-                residencia_id,
-                residencia_nome,
-                nome_personalizado,
-                consumo_projetado_kwh,
-                custo_projetado_reais,
-                pegada_carbono_kg_co2,
-                ROUND(custo_projetado_reais * 0.10, 2) AS economia_financeira_10pct,
-                ROUND(pegada_carbono_kg_co2 * 0.10, 3) AS economia_co2_10pct,
-                ROUND(custo_projetado_reais * 0.20, 2) AS economia_financeira_20pct,
-                ROUND(pegada_carbono_kg_co2 * 0.20, 3) AS economia_co2_20pct,
-                ROUND(custo_projetado_reais * 0.30, 2) AS economia_financeira_30pct,
-                ROUND(pegada_carbono_kg_co2 * 0.30, 3) AS economia_co2_30pct
-            FROM v_consumo_projetado_aparelhos;
-            """)
-            
-            conn.commit()
-            print("✅ Views analíticas atualizadas com sucesso!")
-    except Exception as e:
-        print(f"❌ Erro ao aplicar migrações de views: {e}")
-
-# Executa na carga do módulo
-init_db()
-migrate_db()
+    if not row:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        if isinstance(v, decimal.Decimal):
+            d[k] = float(v)
+        elif isinstance(v, (datetime.datetime, datetime.date)):
+            d[k] = v.isoformat()
+    return d
 
 # -----------------------------------------------------------------------------
-# GERENCIAMENTO DE CONEXÃO COM CONTEXT MANAGER E SQLITE ROW FACTORY
+# CONFIGURAÇÕES DE AMBIENTE E CONEXÃO MYSQL
+# -----------------------------------------------------------------------------
+MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "1!Acesso#9")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "ecoconta")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", 3306))
+
+db_pool = None
+try:
+    print("🔌 Inicializando pool de conexões com o MySQL...")
+    db_pool = mysql.connector.pooling.MySQLConnectionPool(
+        pool_name="ecoconta_pool",
+        pool_size=10,
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT,
+        charset="utf8mb4",
+        use_pure=True
+    )
+    print("✅ Pool de conexões MySQL criado com sucesso!")
+except mysql.connector.Error as e:
+    print(f"❌ Erro ao criar o pool de conexões MySQL: {e}")
+    print("⚠️ Certifique-se de que o MySQL Server está ativo e de que você executou o ecoconta_schema_mysql.sql no MySQL Workbench!")
+
+# -----------------------------------------------------------------------------
+# GERENCIAMENTO DE CONEXÃO COM CONTEXT MANAGER E MYSQL DICTIONARY CURSOR
 # -----------------------------------------------------------------------------
 @contextmanager
 def get_db_connection():
     """
-    Gerenciador de contexto seguro para conexões SQLite.
-    Garante o isolamento de transações, a ativação de chaves estrangeiras (PRAGMA)
-    e o mapeamento de tuplas para dicionários usando sqlite3.Row.
+    Gerenciador de contexto seguro para conexões MySQL.
+    Garante o isolamento de transações e a liberação de conexões de volta ao pool.
+    Retorna cursores com mapeamento de dicionário nativo.
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Permite acesso às colunas por nome
-    
-    # Ativa explicitamente a validação de chaves estrangeiras no SQLite 3
-    conn.execute("PRAGMA foreign_keys = ON;")
+    if not db_pool:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pool de conexões MySQL não inicializado. Verifique se o MySQL Server está ativo."
+        )
     
     try:
+        conn = db_pool.get_connection()
+    except mysql.connector.Error as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Não foi possível obter uma conexão com o MySQL Server: {str(e)}"
+        )
+        
+    try:
         yield conn
-        conn.commit()  # Efetiva a transação se não houver erro
-    except sqlite3.IntegrityError as e:
+        conn.commit()
+    except mysql.connector.IntegrityError as e:
         conn.rollback()
-        # Captura quebras de restrições relacionais e validações do banco (CHECK/UNIQUE)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Falha de validação ou restrição de integridade do banco: {str(e)}"
         )
-    except sqlite3.Error as e:
+    except mysql.connector.Error as e:
         conn.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno de banco de dados SQLite: {str(e)}"
+            detail=f"Erro interno de banco de dados MySQL: {str(e)}"
         )
     finally:
-        conn.close()
+        conn.close() # Retorna a conexão ao pool
 
 # -----------------------------------------------------------------------------
 # MODELOS DE ENTRADA (PYDANTIC SCHEMAS - V2)
@@ -267,7 +141,7 @@ class MetaCreate(BaseModel):
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Ecoconta API",
-    description="Back-end de alto desempenho em FastAPI e SQLite para insights ecológicos e financeiros de consumo elétrico.",
+    description="Back-end de alto desempenho em FastAPI e MySQL para insights ecológicos e financeiros de consumo elétrico.",
     version="1.1.0"
 )
 
@@ -289,8 +163,8 @@ def verificar_residencia_existe(residencia_id: int):
     Lança HTTPException 404 se ausente.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM residencias WHERE id = ?", (residencia_id,))
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT 1 FROM residencias WHERE id = %s", (residencia_id,))
         if not cursor.fetchone():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -309,10 +183,10 @@ def cadastrar_usuario(usuario: UsuarioCreate):
     atribui a residência de semente (demo) a ele automaticamente.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         
         # Verifica se o email já existe
-        cursor.execute("SELECT id FROM usuarios WHERE email = ?;", (usuario.email.strip().lower(),))
+        cursor.execute("SELECT id FROM usuarios WHERE email = %s;", (usuario.email.strip().lower(),))
         if cursor.fetchone():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -325,26 +199,22 @@ def cadastrar_usuario(usuario: UsuarioCreate):
         cursor.execute(
             """
             INSERT INTO usuarios (nome, email, senha_hash)
-            VALUES (?, ?, ?)
-            RETURNING id, nome, email, criado_em;
+            VALUES (%s, %s, %s);
             """,
             (usuario.nome.strip(), usuario.email.strip().lower(), senha_hash)
         )
-        row_usuario = cursor.fetchone()
-        novo_id = row_usuario["id"]
+        novo_id = cursor.lastrowid
         
         # Se houver residências sem usuário cadastrado, fazemos o claim!
         cursor.execute("SELECT id FROM residencias WHERE usuario_id IS NULL;")
         residencias_orfãs = cursor.fetchall()
         if len(residencias_orfãs) > 0:
             print(f"📦 Atribuindo {len(residencias_orfãs)} residência(s) órfã(s) de semente ao novo usuário ID {novo_id}...")
-            cursor.execute("UPDATE residencias SET usuario_id = ? WHERE usuario_id IS NULL;", (novo_id,))
+            cursor.execute("UPDATE residencias SET usuario_id = %s WHERE usuario_id IS NULL;", (novo_id,))
             
-        return {
-            "id": row_usuario["id"],
-            "nome": row_usuario["nome"],
-            "email": row_usuario["email"]
-        }
+        cursor.execute("SELECT id, nome, email FROM usuarios WHERE id = %s;", (novo_id,))
+        row_usuario = cursor.fetchone()
+        return dict(row_usuario)
 
 @app.post("/auth/login", status_code=status.HTTP_200_OK)
 def login_usuario(usuario: UsuarioLogin):
@@ -352,12 +222,12 @@ def login_usuario(usuario: UsuarioLogin):
     Autentica o usuário validando o e-mail e hash da senha.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         
         senha_hash = hashlib.sha256(usuario.senha.encode("utf-8")).hexdigest()
         
         cursor.execute(
-            "SELECT id, nome, email FROM usuarios WHERE email = ? AND senha_hash = ?;",
+            "SELECT id, nome, email FROM usuarios WHERE email = %s AND senha_hash = %s;",
             (usuario.email.strip().lower(), senha_hash)
         )
         row = cursor.fetchone()
@@ -379,10 +249,10 @@ def listar_residencias(usuario_id: Optional[int] = None):
     Retorna uma lista resumida das residências filtradas por usuario_id.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         if usuario_id is not None:
             cursor.execute(
-                "SELECT id, nome, criado_em, usuario_id FROM residencias WHERE usuario_id = ? ORDER BY criado_em DESC;",
+                "SELECT id, nome, criado_em, usuario_id FROM residencias WHERE usuario_id = %s ORDER BY criado_em DESC;",
                 (usuario_id,)
             )
         else:
@@ -398,11 +268,13 @@ def criar_residencia(residencia: ResidenciaCreate):
     Cadastra uma nova residência vinculada ao usuário logado.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute(
-            "INSERT INTO residencias (nome, usuario_id) VALUES (?, ?) RETURNING id, nome, criado_em, usuario_id;",
+            "INSERT INTO residencias (nome, usuario_id) VALUES (%s, %s);",
             (residencia.nome, residencia.usuario_id)
         )
+        nova_id = cursor.lastrowid
+        cursor.execute("SELECT id, nome, criado_em, usuario_id FROM residencias WHERE id = %s;", (nova_id,))
         row = cursor.fetchone()
         return dict(row)
 
@@ -412,8 +284,8 @@ def deletar_residencia(id: int):
     Remove uma residência e todos os seus dados associados (contas, inventário, metas) em cascata.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, nome FROM residencias WHERE id = ?;", (id,))
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, nome FROM residencias WHERE id = %s;", (id,))
         row = cursor.fetchone()
         if not row:
             raise HTTPException(
@@ -421,7 +293,7 @@ def deletar_residencia(id: int):
                 detail=f"Residência com ID {id} não encontrada."
             )
         nome_residencia = row["nome"]
-        cursor.execute("DELETE FROM residencias WHERE id = ?;", (id,))
+        cursor.execute("DELETE FROM residencias WHERE id = %s;", (id,))
         return {"mensagem": f"Residência '{nome_residencia}' e todos os seus dados associados foram removidos do Ecoconta."}
 
 @app.post("/contas", status_code=status.HTTP_201_CREATED)
@@ -433,11 +305,11 @@ def cadastrar_conta(conta: ContaEnergiaCreate):
     verificar_residencia_existe(conta.residencia_id)
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         
         # Verifica se a fatura já existe para esta competência
         cursor.execute(
-            "SELECT id FROM contas_energia WHERE residencia_id = ? AND mes_referencia = ?;",
+            "SELECT id FROM contas_energia WHERE residencia_id = %s AND mes_referencia = %s;",
             (conta.residencia_id, conta.mes_referencia)
         )
         row_existente = cursor.fetchone()
@@ -447,23 +319,27 @@ def cadastrar_conta(conta: ContaEnergiaCreate):
             cursor.execute(
                 """
                 UPDATE contas_energia 
-                SET consumo_kwh = ?, valor_reais = ?, dias_faturamento = ?
-                WHERE id = ?
-                RETURNING id, residencia_id, mes_referencia, consumo_kwh, valor_reais, dias_faturamento, tarifa_calculada;
+                SET consumo_kwh = %s, valor_reais = %s, dias_faturamento = %s
+                WHERE id = %s;
                 """,
                 (conta.consumo_kwh, conta.valor_reais, conta.dias_faturamento, row_existente["id"])
             )
+            id_fatura = row_existente["id"]
         else:
             # Já não existe, fazemos INSERT normal
             cursor.execute(
                 """
                 INSERT INTO contas_energia (residencia_id, mes_referencia, consumo_kwh, valor_reais, dias_faturamento)
-                VALUES (?, ?, ?, ?, ?)
-                RETURNING id, residencia_id, mes_referencia, consumo_kwh, valor_reais, dias_faturamento, tarifa_calculada;
+                VALUES (%s, %s, %s, %s, %s);
                 """,
                 (conta.residencia_id, conta.mes_referencia, conta.consumo_kwh, conta.valor_reais, conta.dias_faturamento)
             )
+            id_fatura = cursor.lastrowid
             
+        cursor.execute(
+            "SELECT id, residencia_id, mes_referencia, consumo_kwh, valor_reais, dias_faturamento, tarifa_calculada FROM contas_energia WHERE id = %s;",
+            (id_fatura,)
+        )
         row = cursor.fetchone()
         return dict(row)
 
@@ -473,14 +349,14 @@ def deletar_conta(id: int):
     Remove uma fatura de faturamento elétrico mensal cadastrada no sistema.
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM contas_energia WHERE id = ?;", (id,))
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM contas_energia WHERE id = %s;", (id,))
         if not cursor.fetchone():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Fatura com ID {id} não encontrada no Ecoconta."
             )
-        cursor.execute("DELETE FROM contas_energia WHERE id = ?;", (id,))
+        cursor.execute("DELETE FROM contas_energia WHERE id = %s;", (id,))
         return {"mensagem": f"Fatura {id} deletada com sucesso do Ecoconta."}
 
 @app.post("/contas/parse-pdf", status_code=status.HTTP_200_OK)
@@ -704,8 +580,8 @@ def adicionar_item_inventario(item: ItemInventarioCreate):
 
     if item.preset_id is not None:
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM presets_eletrodomesticos WHERE id = ?;", (item.preset_id,))
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT 1 FROM presets_eletrodomesticos WHERE id = %s;", (item.preset_id,))
             if not cursor.fetchone():
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -713,14 +589,18 @@ def adicionar_item_inventario(item: ItemInventarioCreate):
                 )
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute(
             """
             INSERT INTO inventario_usuario (residencia_id, preset_id, nome_personalizado, potencia_utilizada, horas_dia, dias_mes)
-            VALUES (?, ?, ?, ?, ?, ?)
-            RETURNING id, residencia_id, preset_id, nome_personalizado, potencia_utilizada, horas_dia, dias_mes;
+            VALUES (%s, %s, %s, %s, %s, %s);
             """,
             (item.residencia_id, item.preset_id, item.nome_personalizado, item.potencia_utilizada, item.horas_dia, item.dias_mes)
+        )
+        nova_id = cursor.lastrowid
+        cursor.execute(
+            "SELECT id, residencia_id, preset_id, nome_personalizado, potencia_utilizada, horas_dia, dias_mes FROM inventario_usuario WHERE id = %s;",
+            (nova_id,)
         )
         row = cursor.fetchone()
         return dict(row)
@@ -733,17 +613,21 @@ def cadastrar_meta(meta: MetaCreate):
     verificar_residencia_existe(meta.residencia_id)
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         # Inativa metas anteriores
-        cursor.execute("UPDATE metas_economia SET ativa = 0 WHERE residencia_id = ?;", (meta.residencia_id,))
+        cursor.execute("UPDATE metas_economia SET ativa = 0 WHERE residencia_id = %s;", (meta.residencia_id,))
         
         cursor.execute(
             """
             INSERT INTO metas_economia (residencia_id, porcentagem_meta, ativa)
-            VALUES (?, ?, 1)
-            RETURNING id, residencia_id, porcentagem_meta, ativa, criado_em;
+            VALUES (%s, %s, 1);
             """,
             (meta.residencia_id, meta.porcentagem_meta)
+        )
+        nova_id = cursor.lastrowid
+        cursor.execute(
+            "SELECT id, residencia_id, porcentagem_meta, ativa, criado_em FROM metas_economia WHERE id = %s;",
+            (nova_id,)
         )
         row = cursor.fetchone()
         return dict(row)
@@ -755,10 +639,10 @@ def obter_presets(categoria: Optional[str] = None):
     Permite filtrar por categoria (ex: 'Chuveiro', 'Ar Condicionado').
     """
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         if categoria:
             cursor.execute(
-                "SELECT id, categoria, nome_comercial, potencia_watts FROM presets_eletrodomesticos WHERE categoria = ? ORDER BY nome_comercial ASC;",
+                "SELECT id, categoria, nome_comercial, potencia_watts FROM presets_eletrodomesticos WHERE categoria = %s ORDER BY nome_comercial ASC;",
                 (categoria,)
             )
         else:
@@ -770,7 +654,7 @@ def obter_presets(categoria: Optional[str] = None):
 
 
 # -----------------------------------------------------------------------------
-# ROTAS ANALÍTICAS: INSIGHTS FINANCEIROS & ECOLÓGICOS (SQLITE VIEWS)
+# ROTAS ANALÍTICAS: INSIGHTS FINANCEIROS & ECOLÓGICOS (MYSQL VIEWS)
 # -----------------------------------------------------------------------------
 
 @app.get("/residencias/{id}/diagnostico", status_code=status.HTTP_200_OK)
@@ -782,7 +666,7 @@ def obter_diagnostico_faturamento(id: int):
     verificar_residencia_existe(id)
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute(
             """
             SELECT 
@@ -798,8 +682,8 @@ def obter_diagnostico_faturamento(id: int):
                 v.desvio_kwh,
                 v.percentual_mapeado
             FROM v_diagnostico_faturamento v
-            JOIN contas_energia c ON v.residencia_id = c.residencia_id AND v.mes_referencia = c.mes_referencia
-            WHERE v.residencia_id = ?
+            INNER JOIN contas_energia c ON v.residencia_id = c.residencia_id AND v.mes_referencia = c.mes_referencia
+            WHERE v.residencia_id = %s
             ORDER BY v.mes_referencia DESC;
             """,
             (id,)
@@ -815,7 +699,7 @@ def obter_diagnostico_faturamento(id: int):
             
         return {
             "residencia_id": id,
-            "historico_analitico": [dict(row) for row in rows]
+            "historico_analitico": [dict_mysql(row) for row in rows]
         }
 
 @app.get("/residencias/{id}/consumo-aparelhos", status_code=status.HTTP_200_OK)
@@ -828,20 +712,20 @@ def obter_consumo_projetado_aparelhos(id: int, mes_referencia: Optional[str] = N
     verificar_residencia_existe(id)
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         
         # Se foi solicitado um mês histórico específico
         if mes_referencia:
             # Verifica se existe fatura cadastrada para o mês
             cursor.execute(
-                "SELECT tarifa_calculada, dias_faturamento FROM contas_energia WHERE residencia_id = ? AND mes_referencia = ?;",
+                "SELECT tarifa_calculada, dias_faturamento FROM contas_energia WHERE residencia_id = %s AND mes_referencia = %s;",
                 (id, mes_referencia)
             )
             row_conta = cursor.fetchone()
             
             # Fallback de tarifa padrão se não houver fatura salva naquele mês específico
-            tarifa = row_conta["tarifa_calculada"] if row_conta else 0.85
-            dias = row_conta["dias_faturamento"] if (row_conta and row_conta["dias_faturamento"]) else 30
+            tarifa = float(row_conta["tarifa_calculada"]) if (row_conta and row_conta["tarifa_calculada"] is not None) else 0.85
+            dias = int(row_conta["dias_faturamento"]) if (row_conta and row_conta["dias_faturamento"] is not None) else 30
             
             cursor.execute(
                 """
@@ -850,12 +734,12 @@ def obter_consumo_projetado_aparelhos(id: int, mes_referencia: Optional[str] = N
                     nome_personalizado,
                     potencia_utilizada,
                     horas_dia,
-                    ? AS dias_mes,
-                    ROUND(((potencia_utilizada * horas_dia * ?) / 1000.0), 2) AS consumo_projetado_kwh,
-                    ROUND(((potencia_utilizada * horas_dia * ?) / 1000.0) * ?, 2) AS custo_projetado_reais,
-                    ROUND(((potencia_utilizada * horas_dia * ?) / 1000.0) * 0.09, 3) AS pegada_carbono_kg_co2
+                    %s AS dias_mes,
+                    ROUND(((potencia_utilizada * horas_dia * %s) / 1000.0), 2) AS consumo_projetado_kwh,
+                    ROUND(((potencia_utilizada * horas_dia * %s) / 1000.0) * %s, 2) AS custo_projetado_reais,
+                    ROUND(((potencia_utilizada * horas_dia * %s) / 1000.0) * 0.09, 3) AS pegada_carbono_kg_co2
                 FROM inventario_usuario
-                WHERE residencia_id = ?
+                WHERE residencia_id = %s
                 ORDER BY consumo_projetado_kwh DESC;
                 """,
                 (dias, dias, dias, tarifa, dias, id)
@@ -874,14 +758,14 @@ def obter_consumo_projetado_aparelhos(id: int, mes_referencia: Optional[str] = N
                     custo_projetado_reais,
                     pegada_carbono_kg_co2
                 FROM v_consumo_projetado_aparelhos
-                WHERE residencia_id = ?
+                WHERE residencia_id = %s
                 ORDER BY consumo_projetado_kwh DESC;
                 """,
                 (id,)
             )
             
         rows = cursor.fetchall()
-        return [dict(row) for row in rows]
+        return [dict_mysql(row) for row in rows]
 
 @app.get("/residencias/{id}/simulador-e-se", status_code=status.HTTP_200_OK)
 def obter_simulacao_e_se(id: int):
@@ -892,7 +776,7 @@ def obter_simulacao_e_se(id: int):
     verificar_residencia_existe(id)
 
     with get_db_connection() as conn:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute(
             """
             SELECT 
@@ -908,14 +792,14 @@ def obter_simulacao_e_se(id: int):
                 economia_financeira_30pct,
                 economia_co2_30pct
             FROM v_simulador_modo_e_se
-            WHERE residencia_id = ?
+            WHERE residencia_id = %s
             ORDER BY consumo_projetado_kwh DESC;
             """,
             (id,)
         )
         rows = cursor.fetchall()
         
-        aparelhos = [dict(row) for row in rows]
+        aparelhos = [dict_mysql(row) for row in rows]
         
         consolidado = {
             "total_atual_reais": round(sum(a["custo_projetado_reais"] for a in aparelhos), 2),

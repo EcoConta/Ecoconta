@@ -295,50 +295,7 @@ export default function HistoricoContas({
                       📊 Detalhes
                     </button>
                     <button 
-                      onClick={() => handleDeletarConta(fat.residencia_id, fat.mes_referencia)} // Nota: em main.py a deleção exige o ID primário da conta, mas como estamos listando faturas, precisamos obter o ID primário!
-                      // Espera, no SQLite, contas_energia tem id primário autoincrement. Na view v_diagnostico_faturamento ou no endpoint /diagnostico, nós retornamos id?
-                      // Vamos verificar no main.py. No endpoint /diagnostico retornamos: residencia_id, residencia_nome, mes_referencia, consumo_real_kwh, valor_real_reais, etc.
-                      // Hum, no endpoint /diagnostico não retornamos o id primário da tabela contas_energia! 
-                      // Mas no SQLite podemos deletar de forma simples baseando-se no par (residencia_id, mes_referencia) que é UNIQUE! 
-                      // Ah, no backend FastAPI criamos a rota DELETE /contas/{id}. Como podemos obter o ID primário se a view de diagnóstico não o traz?
-                      // Podemos alterar a query SQL do SQLite no endpoint /diagnostico para retornar também o 'id' da conta de energia! 
-                      // Vamos certificar se a View 'v_diagnostico_faturamento' tem o ID da conta. 
-                      // Na View 'v_diagnostico_faturamento', a DDL é:
-                      // "SELECT c.residencia_id, r.nome AS residencia_nome, c.mes_referencia, c.consumo_kwh, c.valor_reais, ... FROM contas_energia c..."
-                      // Nós podemos obter o ID primário alterando a View ou simplesmente fazendo o DELETE no frontend?
-                      // Espera! O endpoint /diagnostico pode sim retornar o ID da conta se adicionarmos 'c.id AS conta_id' na view! 
-                      // Ou no backend, podemos criar a deleção baseado no par (residencia_id, mes_referencia) se fizermos 'DELETE /contas/deletar?residencia_id=...&mes_referencia=...'.
-                      // Mas espere, na view 'v_diagnostico_faturamento', nós não colocamos o id da conta.
-                      // Deixe-me ver o ecoconta_schema.sql e ver se c.id está na view. 
-                      // Não está. Mas nós podemos obter o ID da fatura de forma simples! 
-                      // No backend FastAPI, a rota DELETE /contas/{id} foi criada. Nós podemos passar o ID. Como pegamos o ID?
-                      // Nós podemos deletar baseando-se no ID. Mas se não temos o ID no payload do GET /diagnostico, podemos adicionar 'c.id AS conta_id' na View, ou buscar no banco.
-                      // Para não precisar recriar a View (que já foi salva no SQLite), nós podemos simplesmente rodar uma query no backend no endpoint de deleção que aceita residencia_id e mes_referencia, o que é MUITO mais elegante e não exige alterar o schema SQL salvo fisicamente!
-                      // Vamos ajustar a API DELETE para aceitar residencia_id e mes_referencia na query string, ou simplesmente adicionar uma rota extra! 
-                      // Espera, no main.py que reescrevemos agora há pouco, a rota DELETE /contas/{id} deleta por ID.
-                      // Mas na listagem de faturas, se não temos o ID, nós podemos alterar o endpoint do backend /contas/{id} ou criar um DELETE que busca por residencia_id e mes_referencia. 
-                      // Deixe-me ver: no main.py, na View v_diagnostico_faturamento, nós retornamos:
-                      // SELECT c.residencia_id, r.nome AS residencia_nome, c.mes_referencia, c.consumo_kwh AS consumo_real_kwh, c.valor_reais AS valor_real_reais, ...
-                      // Se tivéssemos o id da conta, seria perfeito. Podemos fazer no backend na rota DELETE uma alteração simples: aceitar o ID, ou se passarmos mes_referencia e residencia_id como parâmetros de query.
-                      // Mas espera! No main.py, a tabela contas_energia tem o id. 
-                      // Na verdade, nós podemos simplesmente fazer um SELECT no backend do id da conta baseado no mes_referencia e residencia_id antes de deletar! 
-                      // Mas para deletar diretamente de forma simples: o endpoint DELETE /contas/{id} serve perfeitamente se passarmos o ID.
-                      // Como o front-end pode saber o ID se ele não está no faturas list?
-                      // Vamos alterar a query do GET /residencias/{id}/diagnostico em main.py!
-                      // No main.py, o endpoint é:
-                      // "SELECT residencia_id, residencia_nome, mes_referencia, consumo_real_kwh, valor_real_reais, ... FROM v_diagnostico_faturamento WHERE residencia_id = ?"
-                      // Mas espera! Nós podemos fazer um JOIN simples ou alterar a query do GET /diagnostico para retornar também o ID da tabela contas_energia!
-                      // Como a tabela contas_energia e v_diagnostico_faturamento têm o mesmo mes_referencia e residencia_id, podemos fazer na query do FastAPI:
-                      // SELECT c.id AS conta_id, v.residencia_id, v.residencia_nome, v.mes_referencia, ... FROM v_diagnostico_faturamento v JOIN contas_energia c ON v.residencia_id = c.residencia_id AND v.mes_referencia = c.mes_referencia ...
-                      // Isso é GENIAL, extremamente profissional e resolve o problema sem mexer na View física persistida!
-                      // Vamos fazer exatamente isso na query do GET no backend!
-                      // Deixe-me ver o main.py. No main.py, a query do GET /diagnostico é:
-                      // "SELECT residencia_id, residencia_nome, mes_referencia, ... FROM v_diagnostico_faturamento WHERE residencia_id = ?"
-                      // Nós podemos alterá-la para:
-                      // "SELECT c.id AS conta_id, v.residencia_id, v.residencia_nome, v.mes_referencia, v.consumo_real_kwh, v.valor_real_reais, v.consumo_inventariado_kwh, v.valor_inventariado_reais, v.desvio_kwh, v.percentual_mapeado FROM v_diagnostico_faturamento v JOIN contas_energia c ON v.residencia_id = c.residencia_id AND v.mes_referencia = c.mes_referencia WHERE v.residencia_id = ?"
-                      // Perfeito! Isso nos dá o 'conta_id' em cada item retornado. E na listagem podemos fazer: api.deletarConta(fat.conta_id)!
-                      // Deixe-me atualizar o main.py com essa query aprimorada e precisa!
-                      // Vou usar a ferramenta replace_file_content no main.py na linha da query do GET /diagnostico.
+                      onClick={() => handleDeletarConta(fat.conta_id, fat.mes_referencia)}
                       className="btn-secondary" 
                       style={{ ...styles.btnActionSmall, color: "hsl(var(--color-accent-red))", borderColor: "rgba(239,68,68,0.2)" }}
                     >
